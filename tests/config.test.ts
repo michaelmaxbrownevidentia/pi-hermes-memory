@@ -431,4 +431,29 @@ describe("loadConfig", () => {
     assert.strictEqual(config.correctionNegativePatterns, undefined);
     assert.strictEqual(config.correctionDirectiveWords, undefined);
   });
+
+  it("loads complete shared-memory configuration and ignores incomplete configuration", () => {
+    fs.mkdirSync(path.dirname(TEST_CONFIG_PATH), { recursive: true });
+    fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({
+      sharedMemory: {
+        enabled: true,
+        sharedRoot: "~/.local/share/agent-memory",
+        localIndexDir: "~/.pi/agent/pi-hermes-memory",
+        writerHost: "dev",
+        scopeRules: [{ scope: "org:evidentia", pathPrefixes: ["~/Development/Evidentia-Web-App"] }],
+        activeWorkflows: [" finance ", ""],
+      },
+    }));
+    assert.deepStrictEqual(loadConfig(TEST_CONFIG_PATH).sharedMemory, {
+      enabled: true,
+      sharedRoot: "~/.local/share/agent-memory",
+      localIndexDir: "~/.pi/agent/pi-hermes-memory",
+      writerHost: "dev",
+      scopeRules: [{ scope: "org:evidentia", pathPrefixes: ["~/Development/Evidentia-Web-App"] }],
+      activeWorkflows: ["finance"],
+    });
+
+    fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({ sharedMemory: { enabled: true, sharedRoot: "/tmp/shared" } }));
+    assert.strictEqual(loadConfig(TEST_CONFIG_PATH).sharedMemory, undefined);
+  });
 });

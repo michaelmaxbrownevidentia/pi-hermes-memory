@@ -3,6 +3,7 @@
  */
 
 import type { ModelThinkingLevel, TextContent } from "@earendil-works/pi-ai";
+import type { SharedMemoryConfig } from "./shared-memory-context.js";
 
 export type MemoryOverflowStrategy = "auto-consolidate" | "reject" | "fifo-evict";
 
@@ -88,6 +89,8 @@ export interface MemoryConfig {
   autoConsolidationWarnOnFailure: boolean;
   /** Inject pinned STANDING.md instructions into every session. Default: true */
   standingInstructionsEnabled: boolean;
+  /** Conflict-safe Syncthing-backed shared memory. Disabled unless explicitly configured. */
+  sharedMemory?: SharedMemoryConfig;
 }
 
 export type MemoryCategory =
