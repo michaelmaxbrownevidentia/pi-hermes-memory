@@ -80,6 +80,17 @@ function safeWriter(writer: string): string {
   return normalized;
 }
 
+function assertRealDirectory(directory: string, root: string): string {
+  const stat = fs.lstatSync(directory);
+  if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error(`Journal path must be a real directory: ${directory}`);
+  const canonical = fs.realpathSync(directory);
+  const canonicalRoot = fs.realpathSync(root);
+  if (canonical !== canonicalRoot && !canonical.startsWith(canonicalRoot + path.sep)) {
+    throw new Error(`Journal path escapes shared root: ${directory}`);
+  }
+  return canonical;
+}
+
 function operationOrder(left: JournalOperation, right: JournalOperation): number {
   return left.timestamp.localeCompare(right.timestamp)
     || left.writer.localeCompare(right.writer)
@@ -145,19 +156,22 @@ export function reconcileOperations(operations: JournalOperation[]): JournalStat
       updated: add.timestamp,
       deleted: false,
     };
+    const equivalentParentOpIds = new Set([add.opId]);
     for (const duplicate of validAdds.slice(1)) {
       const identical = current.scope === duplicate.scope
         && current.target === duplicate.target
         && current.content === duplicate.content!.trim()
         && current.category === (duplicate.category ?? null)
         && current.failureReason === (duplicate.failureReason?.trim() || null);
-      if (!identical) conflicts.push(conflictFor(duplicate, "entry_exists", current.revision));
+      if (identical) equivalentParentOpIds.add(duplicate.opId);
+      else conflicts.push(conflictFor(duplicate, "entry_exists", current.revision));
     }
 
+    let acceptedParentOpIds = equivalentParentOpIds;
     const mutations = group.filter((op) => op.action !== "add");
     while (!current.deleted) {
       const candidates = mutations.filter((op) =>
-        op.expectedRevision === current.revision && op.expectedParentOpId === current.headOpId
+        op.expectedRevision === current.revision && op.expectedParentOpId !== undefined && acceptedParentOpIds.has(op.expectedParentOpId)
       ).sort(operationOrder);
       if (candidates.length === 0) break;
       const winner = candidates[0];
@@ -178,6 +192,7 @@ export function reconcileOperations(operations: JournalOperation[]): JournalStat
             failureReason: winner.failureReason === undefined ? current.failureReason : winner.failureReason?.trim() || null,
             updated: winner.timestamp,
           };
+      acceptedParentOpIds = new Set([winner.opId]);
       mutations.splice(mutations.indexOf(winner), 1);
       for (const loser of candidates.slice(1)) {
         conflicts.push(conflictFor(loser, "revision_mismatch", current.revision));
@@ -199,30 +214,77 @@ class LocalJournalIndex {
   private db: any;
   constructor(private readonly filePath: string) {}
 
+  private isRebuildable(error: unknown): boolean {
+    const code = error && typeof error === "object" && "code" in error ? String((error as { code?: unknown }).code) : "";
+    if (code === "SQLITE_CORRUPT" || code === "SQLITE_NOTADB") return true;
+    const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+    return message.includes("file is not a database")
+      || message.includes("database disk image is malformed")
+      || message.includes("malformed database schema")
+      || message.includes("no such column: head_op_id")
+      || (message.includes("table entries has") && message.includes("columns"));
+  }
+
   private open(): any {
     if (this.db) return this.db;
+    try {
+      return this.openUnchecked();
+    } catch (error) {
+      if (!this.isRebuildable(error)) throw error;
+      this.quarantine();
+      return this.openUnchecked();
+    }
+  }
+
+  private openUnchecked(): any {
     fs.mkdirSync(path.dirname(this.filePath), { recursive: true, mode: 0o700 });
     const require = createRequire(import.meta.url);
     const Database = require("better-sqlite3");
-    this.db = new Database(this.filePath);
-    this.db.pragma("journal_mode = WAL");
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS entries (
-        id TEXT PRIMARY KEY, revision INTEGER NOT NULL, head_op_id TEXT NOT NULL, owner TEXT NOT NULL, scope TEXT NOT NULL,
-        target TEXT NOT NULL, content TEXT NOT NULL, category TEXT, failure_reason TEXT,
-        created TEXT NOT NULL, updated TEXT NOT NULL, deleted INTEGER NOT NULL
-      );
-      CREATE VIRTUAL TABLE IF NOT EXISTS entry_fts USING fts5(id UNINDEXED, content, tokenize='trigram');
-      CREATE TABLE IF NOT EXISTS conflicts (
-        op_id TEXT PRIMARY KEY, entry_id TEXT NOT NULL, writer TEXT NOT NULL, reason TEXT NOT NULL,
-        expected_revision INTEGER NOT NULL, actual_revision INTEGER
-      );
-    `);
-    return this.db;
+    const db = new Database(this.filePath);
+    try {
+      db.pragma("busy_timeout = 5000");
+      db.pragma("journal_mode = WAL");
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS entries (
+          id TEXT PRIMARY KEY, revision INTEGER NOT NULL, head_op_id TEXT NOT NULL, owner TEXT NOT NULL, scope TEXT NOT NULL,
+          target TEXT NOT NULL, content TEXT NOT NULL, category TEXT, failure_reason TEXT,
+          created TEXT NOT NULL, updated TEXT NOT NULL, deleted INTEGER NOT NULL
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS entry_fts USING fts5(id UNINDEXED, content, tokenize='trigram');
+        CREATE TABLE IF NOT EXISTS conflicts (
+          op_id TEXT PRIMARY KEY, entry_id TEXT NOT NULL, writer TEXT NOT NULL, reason TEXT NOT NULL,
+          expected_revision INTEGER NOT NULL, actual_revision INTEGER
+        );
+      `);
+      this.db = db;
+      return db;
+    } catch (error) {
+      try { db.close(); } catch {}
+      throw error;
+    }
+  }
+
+  private quarantine(): void {
+    if (this.db) { try { this.db.close(); } catch {} this.db = null; }
+    const suffix = `.corrupt-${Date.now()}`;
+    for (const sidecar of ["", "-wal", "-shm"]) {
+      const source = `${this.filePath}${sidecar}`;
+      if (fs.existsSync(source)) fs.renameSync(source, `${this.filePath}${suffix}${sidecar}`);
+    }
   }
 
   rebuild(state: JournalState): void {
+    try {
+      this.rebuildUnchecked(state);
+    } catch (error) {
+      if (!this.isRebuildable(error)) throw error;
+      this.quarantine();
+      this.rebuildUnchecked(state);
+    }
+  }
+
+  private rebuildUnchecked(state: JournalState): void {
     const db = this.open();
     const current = db.prepare("SELECT value FROM metadata WHERE key='journal_hash'").get()?.value;
     if (current === state.journalHash) return;
@@ -281,11 +343,17 @@ export class SharedMemoryJournal {
   load(): JournalState {
     const operations: JournalOperation[] = [];
     if (fs.existsSync(this.journalRoot())) {
+      assertRealDirectory(this.journalRoot(), this.options.sharedRoot);
       for (const writer of fs.readdirSync(this.journalRoot()).sort()) {
         const directory = path.join(this.journalRoot(), writer);
-        if (!fs.statSync(directory).isDirectory()) continue;
+        const stat = fs.lstatSync(directory);
+        if (stat.isSymbolicLink()) throw new Error(`Journal writer partition cannot be a symlink: ${directory}`);
+        if (!stat.isDirectory()) continue;
+        assertRealDirectory(directory, this.options.sharedRoot);
         for (const name of fs.readdirSync(directory).filter((item) => item.endsWith(".json")).sort()) {
           const filePath = path.join(directory, name);
+          const fileStat = fs.lstatSync(filePath);
+          if (fileStat.isSymbolicLink() || !fileStat.isFile()) throw new Error(`Journal operation must be a regular file: ${filePath}`);
           const operation = parseOperation(fs.readFileSync(filePath, "utf8"), filePath);
           if (operation.writer !== writer) throw new Error(`Journal writer does not match partition: ${filePath}`);
           operations.push(operation);
@@ -298,8 +366,12 @@ export class SharedMemoryJournal {
   }
 
   private append(op: JournalOperation): void {
+    const journalRoot = this.journalRoot();
+    fs.mkdirSync(journalRoot, { recursive: true, mode: 0o700 });
+    assertRealDirectory(journalRoot, this.options.sharedRoot);
     const directory = this.writerDir();
     fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    assertRealDirectory(directory, this.options.sharedRoot);
     const filePath = path.join(directory, `${op.opId}.json`);
     const tempPath = path.join(directory, `.${op.opId}.tmp`);
     const handle = fs.openSync(tempPath, "wx", 0o600);

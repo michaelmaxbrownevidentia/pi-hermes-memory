@@ -74,8 +74,12 @@ export function registerSharedMemoryTools(pi: ExtensionAPI, journal: SharedMemor
         const state = journal.load();
         let scopes: MemoryScope[];
         if (raw.all_scopes) scopes = [...new Set(state.entries.map((entry) => entry.scope))];
-        else if (raw.scopes) scopes = raw.scopes.map(validateMemoryScope);
-        else scopes = activeMemoryScopes(config, ctx?.cwd);
+        else if (raw.scopes) {
+          const active = new Set(activeMemoryScopes(config, ctx?.cwd));
+          scopes = raw.scopes.map(validateMemoryScope);
+          const inactive = scopes.filter((scope) => !active.has(scope));
+          if (inactive.length > 0) throw new Error(`Requested scope is outside the active context: ${inactive.join(", ")}. Set all_scopes=true for an explicit cross-scope audit.`);
+        } else scopes = activeMemoryScopes(config, ctx?.cwd);
         const target = raw.target ? storedTarget(raw.target) : undefined;
         const entries = journal.search(raw.query, scopes, { target, category: raw.category as MemoryCategory | undefined, limit: raw.limit });
         const output = entries.map((entry) => `[entry_id=${entry.id}] [revision=${entry.revision}] [head_op_id=${entry.headOpId}] [scope=${entry.scope}] [target=${entry.target}]${entry.category ? ` [${entry.category}]` : ""} ${entry.content}`).join("\n\n");

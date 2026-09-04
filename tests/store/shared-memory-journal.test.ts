@@ -88,6 +88,29 @@ describe("SharedMemoryJournal", () => {
     dev.close();
   });
 
+  it("rebuilds a corrupt local SQLite cache from the journal", () => {
+    const root = temp(); const first = journal(root, "dev");
+    const entry = first.add({ scope: "global", target: "memory", content: "recoverable journal fact" });
+    first.close();
+    fs.writeFileSync(path.join(root, "local-dev/shared-memory.db"), "not sqlite");
+    const rebuilt = journal(root, "dev");
+    assert.equal(rebuilt.search("recoverable", ["global"])[0].id, entry.id);
+    assert.ok(fs.readdirSync(path.join(root, "local-dev")).some((name) => name.includes(".corrupt-")));
+    rebuilt.close();
+  });
+
+  it("rejects symlinked writer partitions and operation files", () => {
+    const root = temp(); const shared = path.join(root, "shared"); const journalRoot = path.join(shared, "journal"); const outside = path.join(root, "outside");
+    fs.mkdirSync(journalRoot, { recursive: true }); fs.mkdirSync(outside);
+    fs.symlinkSync(outside, path.join(journalRoot, "laptop"));
+    const dev = journal(root, "dev");
+    assert.throws(() => dev.load(), /partition cannot be a symlink/);
+    fs.rmSync(path.join(journalRoot, "laptop")); fs.mkdirSync(path.join(journalRoot, "laptop"));
+    fs.writeFileSync(path.join(outside, "op.json"), "{}"); fs.symlinkSync(path.join(outside, "op.json"), path.join(journalRoot, "laptop/op.json"));
+    assert.throws(() => dev.load(), /regular file/);
+    dev.close();
+  });
+
   it("scans failure reasons and rejects canonical index paths inside the shared root", () => {
     const root = temp(); const dev = journal(root, "dev");
     assert.throws(() => dev.add({ scope: "global", target: "failure", content: "safe", failureReason: "OPENAI_API_KEY=sk-123456789012345678901234" }), /Unsafe failureReason/);
@@ -114,6 +137,14 @@ describe("reconcileOperations", () => {
     const add = (writer: string): JournalOperation => ({ schema: 1, opId: writer, writer, timestamp: "2026-01-01T00:00:00Z", entryId: "legacy-id", action: "add", expectedRevision: 0, scope: "global", target: "memory", content: "same", category: "insight" });
     const state = reconcileOperations([add("dev"), add("laptop")]);
     assert.equal(state.entries.length, 1); assert.equal(state.conflicts.length, 0);
+  });
+
+  it("accepts descendants whose parent is an identical migration add alias", () => {
+    const first: JournalOperation = { schema: 1, opId: "first", writer: "dev", timestamp: "2026-01-02T00:00:00Z", entryId: "legacy-id", action: "add", expectedRevision: 0, scope: "global", target: "memory", content: "same" };
+    const duplicate: JournalOperation = { ...first, opId: "duplicate", writer: "laptop", timestamp: "2026-01-01T00:00:00Z" };
+    const descendant: JournalOperation = { schema: 1, opId: "update", writer: "dev", timestamp: "2026-01-03T00:00:00Z", entryId: "legacy-id", action: "update", expectedRevision: 1, expectedParentOpId: "first", content: "updated" };
+    const state = reconcileOperations([first, duplicate, descendant]);
+    assert.equal(state.entries[0].content, "updated"); assert.equal(state.conflicts.length, 0);
   });
 
   it("surfaces differing metadata on duplicate stable IDs", () => {
