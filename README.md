@@ -104,6 +104,29 @@ npm run check
 npm test
 ```
 
+### SQLite runtime compatibility
+
+Pi's distributed executable runs on Bun, while source tests normally run on Node. SQLite code must therefore use `bun:sqlite` inside compiled Pi and the shared `loadBetterSqlite3()` loader under Node. Feature code must not load `better-sqlite3` directly.
+
+After changing SQLite initialization or adding a SQLite consumer, run the normal checks **and** start the installed compiled Pi runtime:
+
+```bash
+PI_BIN=$(command -v pi) || { echo "pi is not installed" >&2; exit 1; }
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+printf '%s\n' 'export default function () { if (!("Bun" in globalThis)) throw new Error("This smoke test requires Bun-compiled Pi"); }' >"$tmp/assert-bun.ts"
+if ! "$PI_BIN" --no-extensions -e "$tmp/assert-bun.ts" -e ./src/index.ts --mode rpc --offline </dev/null >"$tmp/output" 2>&1; then
+  cat "$tmp/output" >&2
+  exit 1
+fi
+if grep -E 'extension_error|ResolveMessage|better-sqlite3' "$tmp/output"; then
+  cat "$tmp/output" >&2
+  exit 1
+fi
+```
+
+This smoke test is required because Node/tsx tests cannot detect Bun-only package-resolution failures.
+
 ## Installation
 
 ```bash
@@ -122,9 +145,9 @@ Or test locally without installing:
 pi -e /path/to/pi-hermes-memory/src/index.ts
 ```
 
-### Homebrew / Node ABI mismatches
+### Node ABI mismatches
 
-`better-sqlite3` is a native addon. If Pi is installed via Homebrew and the extension was compiled for a different Node ABI, session search may warn:
+Compiled Pi uses Bun's built-in SQLite and does not load `better-sqlite3`. In Node-hosted development or other Node installations, `better-sqlite3` is a native addon. If the extension was compiled for a different Node ABI, session search may warn:
 
 ```text
 was compiled against a different Node.js version using NODE_MODULE_VERSION ...

@@ -8,9 +8,9 @@ This is a Pi coding agent extension that brings Hermes-style persistent memory a
 
 ## Architecture
 
-- **Language**: TypeScript (loaded via jiti, no compilation needed at runtime)
-- **Runtime**: Pi extension API (`@earendil-works/pi-coding-agent`)
-- **Storage**: Two markdown files (`MEMORY.md`, `USER.md`) in `~/.pi/agent/memory/`
+- **Language**: TypeScript (loaded directly by Pi)
+- **Runtime**: Pi extension API (`@earendil-works/pi-coding-agent`); source/dev runs use Node, while the distributed Pi executable is compiled with Bun
+- **Storage**: Markdown memory, an immutable host-partitioned shared journal, and host-local SQLite indexes
 - **Entry point**: `src/index.ts` — registers tools, event handlers, and commands
 
 ## Key Files
@@ -36,7 +36,8 @@ This is a Pi coding agent extension that brings Hermes-style persistent memory a
 2. **Atomic writes** — Temp file + `fs.rename()` for crash safety
 3. **`pi.exec()` for background review** — Stays within Pi's intended extension API
 4. **`§` delimiter** — Same as Hermes for consistency
-5. **No SQLite** — Pi has its own `SessionManager`, we read from it directly
+5. **SQLite is always host-local** — synchronized data uses immutable journal operations; active SQLite databases are never synchronized
+6. **Dual-runtime SQLite** — compiled Pi must use `bun:sqlite`; Node source/test runs use `better-sqlite3` through `loadBetterSqlite3()`
 
 ## Hermes Source Reference
 
@@ -59,13 +60,36 @@ The implementation is ported from the Hermes agent harness. See `PLAN.md` → "H
 
 ## Development
 
-```bash
-# Type check
-npm run check
+### SQLite runtime rule
 
-# Test locally
-pi -e ./src/index.ts
+Never call `require("better-sqlite3")` directly from feature code. Every SQLite entry point must select the runtime lazily:
+
+- compiled Pi / Bun: `isBunRuntime()` and `bun:sqlite`
+- Node: `loadBetterSqlite3()` from `src/store/sqlite-native.ts`
+
+Keep native loading out of module scope so one resolver or ABI failure cannot prevent the extension from loading. When adding a new SQLite consumer, follow the adapters in `src/store/db.ts`, `src/store/atomic-lock-coordinator.ts`, or `src/extension-root-migration.ts`.
+
+```bash
+npm run check
+npm test
+
+# Required after changing SQLite initialization or adapters: exercise the
+# checkout under a Bun-compiled Pi binary, not only Node/tsx tests.
+PI_BIN=$(command -v pi) || { echo "pi is not installed" >&2; exit 1; }
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+printf '%s\n' 'export default function () { if (!("Bun" in globalThis)) throw new Error("This smoke test requires Bun-compiled Pi"); }' >"$tmp/assert-bun.ts"
+if ! "$PI_BIN" --no-extensions -e "$tmp/assert-bun.ts" -e ./src/index.ts --mode rpc --offline </dev/null >"$tmp/output" 2>&1; then
+  cat "$tmp/output" >&2
+  exit 1
+fi
+if grep -E 'extension_error|ResolveMessage|better-sqlite3' "$tmp/output"; then
+  cat "$tmp/output" >&2
+  exit 1
+fi
 ```
+
+A Node-only test can pass while compiled Pi still fails, because Bun cannot resolve the extension's native `better-sqlite3` package. The compiled-Pi smoke test is therefore part of the done condition for every SQLite-path change.
 
 ## Installation (for users)
 
