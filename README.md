@@ -576,6 +576,34 @@ PI_TIMING=1 pi
 
 The deferred backfill, live-index, and integrity-check spans may appear after startup spans because they run on later timer turns. `/reload` does not run `shutdown.flush`; other shutdown reasons keep the configured direct completion and subprocess fallback. Use the measured spans before changing indexing, checkpoint, or synchronization policy.
 
+## Shared scoped memory (opt-in)
+
+For machines connected by Syncthing, shared mode stores only immutable, writer-partitioned JSON operations in the synchronized root. SQLite remains in `localIndexDir` and is rebuilt from the journal; existing Markdown stores are retained as migration evidence.
+
+```json
+{
+  "sharedMemory": {
+    "enabled": true,
+    "sharedRoot": "~/.local/share/agent-memory",
+    "localIndexDir": "~/.pi/agent/pi-hermes-memory",
+    "writerHost": "dev",
+    "scopeRules": [
+      { "scope": "org:evidentia", "pathPrefixes": ["~/Development/Evidentia-Web-App", "~/Development/Evidentia-Pipeline"] }
+    ]
+  }
+}
+```
+
+`memory_search` defaults to `global` plus the active `host:`, `org:`, `repo:` and configured `workflow:` scopes. Search results return stable `entry_id`, `revision` and `head_op_id`; replace/remove require all three, so stale or divergent concurrent mutations fail visibly. `all_scopes` is explicit. Repository scope uses the Git repository name, so equivalent Laptop/Dev checkouts and linked worktrees select the same scope.
+
+Migrate a host non-destructively after Syncthing is configured:
+
+```bash
+npm run memory:migrate-shared -- --host dev
+```
+
+The command copies every existing Markdown memory file to a timestamped local backup, records byte hashes/counts, appends baseline entries to that host's journal partition, and leaves every original untouched.
+
 ## Where Data Lives
 
 ```

@@ -137,6 +137,35 @@ export function loadConfig(configPath = DEFAULT_CONFIG_PATH): MemoryConfig {
       if (typeof parsed.failureInjectionMaxEntries === "number") config.failureInjectionMaxEntries = parsed.failureInjectionMaxEntries;
       if (typeof parsed.nudgeToolCalls === "number") config.nudgeToolCalls = parsed.nudgeToolCalls;
       if (typeof parsed.standingInstructionsEnabled === "boolean") config.standingInstructionsEnabled = parsed.standingInstructionsEnabled;
+      if (
+        typeof parsed.sharedMemory === "object" && parsed.sharedMemory !== null
+        && parsed.sharedMemory.enabled === true
+        && typeof parsed.sharedMemory.sharedRoot === "string"
+        && typeof parsed.sharedMemory.localIndexDir === "string"
+        && typeof parsed.sharedMemory.writerHost === "string"
+      ) {
+        const scopeRules = Array.isArray(parsed.sharedMemory.scopeRules)
+          ? parsed.sharedMemory.scopeRules.filter((rule: unknown) => {
+              if (typeof rule !== "object" || rule === null) return false;
+              const candidate = rule as { scope?: unknown; pathPrefixes?: unknown };
+              return typeof candidate.scope === "string"
+                && candidate.scope.startsWith("org:")
+                && Array.isArray(candidate.pathPrefixes)
+                && candidate.pathPrefixes.every((prefix) => typeof prefix === "string");
+            })
+          : undefined;
+        const activeWorkflows = isStringArray(parsed.sharedMemory.activeWorkflows)
+          ? parsed.sharedMemory.activeWorkflows.map((item: string) => item.trim()).filter(Boolean)
+          : undefined;
+        config.sharedMemory = {
+          enabled: true,
+          sharedRoot: parsed.sharedMemory.sharedRoot,
+          localIndexDir: parsed.sharedMemory.localIndexDir,
+          writerHost: parsed.sharedMemory.writerHost,
+          scopeRules,
+          activeWorkflows,
+        };
+      }
       if (typeof parsed.projectCharLimit === "number") config.projectCharLimit = parsed.projectCharLimit;
       if (typeof parsed.memoryDir === "string") {
         const normalizedMemoryDir = normalizeConfiguredMemoryDir(parsed.memoryDir);

@@ -60,6 +60,9 @@ import { migrateLegacyProjectMemoryDirs } from "./project-memory-migration.js";
 import { AGENT_ROOT } from "./paths.js";
 import { isDatabaseMigrationPending } from "./extension-root-migration.js";
 import { measureLifecycle, measureLifecycleSync } from "./lifecycle-timing.js";
+import { SharedMemoryJournal } from "./store/shared-memory-journal.js";
+import { assertSharedRootSafe, normalizeSharedMemoryConfig } from "./shared-memory-context.js";
+import { registerSharedMemoryTools } from "./tools/shared-memory-tools.js";
 
 export function resolveProjectSkillDiscovery(
   skillStore: SkillStore,
@@ -90,6 +93,11 @@ export function registerProjectSkillDiscoveryHandler(
 
 export default function (pi: ExtensionAPI) {
   const config = loadConfig();
+  const sharedMemoryConfig = config.sharedMemory?.enabled
+    ? normalizeSharedMemoryConfig(config.sharedMemory)
+    : null;
+  if (sharedMemoryConfig) assertSharedRootSafe(sharedMemoryConfig);
+  const sharedJournal = sharedMemoryConfig ? new SharedMemoryJournal(sharedMemoryConfig) : null;
 
   const agentRoot = AGENT_ROOT;
   const legacyGlobalDir = path.join(agentRoot, "memory");
@@ -215,6 +223,8 @@ export default function (pi: ExtensionAPI) {
       if (standingStore) await standingStore.load();
     });
 
+    if (sharedJournal) sharedJournal.load();
+
     if (persistenceInitialized) {
       try {
         pruneEphemeralReviewSessions(dbManager);
@@ -254,20 +264,26 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // ── 3. Register action-specific memory write tools with SQLite sync ──
-  configureMemoryToolProjectStore = registerMemoryTool(pi, store, projectStoreRef, dbManager, projectNameRef, bindProjectFromCwd);
+  // ── 3. Register action-specific memory tools ──
+  if (sharedJournal && sharedMemoryConfig) {
+    registerSharedMemoryTools(pi, sharedJournal, sharedMemoryConfig);
+  } else {
+    configureMemoryToolProjectStore = registerMemoryTool(pi, store, projectStoreRef, dbManager, projectNameRef, bindProjectFromCwd);
+  }
 
   // ── 4. Register the skill tool ──
   registerSkillTool(pi, skillStore);
 
   // ── 5. Setup background learning loop (with tool-call-aware nudge) ──
-  setupBackgroundReview(pi, store, projectStoreRef, config, {
-    dbManager,
-    projectName: projectNameRef,
-  });
+  if (!sharedJournal) {
+    setupBackgroundReview(pi, store, projectStoreRef, config, {
+      dbManager,
+      projectName: projectNameRef,
+    });
 
-  // ── 6. Setup session-end flush ──
-  setupSessionFlush(pi, store, projectStoreRef, config, dbManager, projectNameRef);
+    // ── 6. Setup session-end flush ──
+    setupSessionFlush(pi, store, projectStoreRef, config, dbManager, projectNameRef);
+  }
 
   // ── 7. Setup auto-consolidation (inject consolidator into stores) ──
   // Keep the failure in the tool result regardless; session-console logging is
@@ -303,19 +319,21 @@ export default function (pi: ExtensionAPI) {
     );
   };
   configureProjectStore(projectStore);
-  registerConsolidateCommand(pi, store, config.consolidationTimeoutMs, projectStoreRef, projectNameRef, config, dbManager);
+  if (!sharedJournal) registerConsolidateCommand(pi, store, config.consolidationTimeoutMs, projectStoreRef, projectNameRef, config, dbManager);
 
   // ── 8. Setup correction detection ──
-  setupCorrectionDetector(pi, store, projectStoreRef, config, dbManager, projectNameRef);
+  if (!sharedJournal) setupCorrectionDetector(pi, store, projectStoreRef, config, dbManager, projectNameRef);
 
   // ── 9. Register commands ──
-  registerInsightsCommand(pi, store, projectStoreRef, projectNameRef);
+  if (!sharedJournal) {
+    registerInsightsCommand(pi, store, projectStoreRef, projectNameRef);
+    registerInterviewCommand(pi, store);
+    registerSwitchProjectCommand(pi, config);
+    registerSyncMarkdownMemoriesCommand(pi, dbManager, globalDir, config.projectsMemoryDir, agentRoot);
+    registerPreviewContextCommand(pi, store, projectStoreRef, projectNameRef, config, standingStore);
+  }
   registerSkillsCommand(pi, skillStore);
-  registerInterviewCommand(pi, store);
-  registerSwitchProjectCommand(pi, config);
   registerLearnMemoryCommand(pi);
-  registerSyncMarkdownMemoriesCommand(pi, dbManager, globalDir, config.projectsMemoryDir, agentRoot);
-  registerPreviewContextCommand(pi, store, projectStoreRef, projectNameRef, config, standingStore);
   if (standingStore) registerStandingPinCommand(pi, standingStore);
 
   // ── 10. Live session indexing ──
@@ -327,7 +345,7 @@ export default function (pi: ExtensionAPI) {
 
   // ── 11. SQLite session search + extended memory ──
   registerSessionSearchTool(pi, dbManager, config.sessionSearch ?? { variant: "legacy" });
-  registerMemorySearchTool(pi, dbManager);
+  if (!sharedJournal) registerMemorySearchTool(pi, dbManager);
   registerIndexSessionsCommand(pi);
 
   // ── 12. Auto-index session on shutdown ──
@@ -371,6 +389,7 @@ export default function (pi: ExtensionAPI) {
         // Best effort only — shutdown should not be held up by indexing errors.
       }
       try {
+        sharedJournal?.close();
         measureLifecycleSync("shutdown.database-close", () => dbManager.close());
       } catch { /* best effort — never block shutdown */ }
     }
