@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { createRequire } from "node:module";
 import { scanContent } from "./content-scanner.js";
+import { isBunRuntime, loadBetterSqlite3 } from "./sqlite-native.js";
 import type { MemoryCategory } from "../types.js";
 
 export type MemoryScope = `global` | `host:${string}` | `org:${string}` | `repo:${string}` | `workflow:${string}`;
@@ -239,11 +240,12 @@ class LocalJournalIndex {
   private openUnchecked(): any {
     fs.mkdirSync(path.dirname(this.filePath), { recursive: true, mode: 0o700 });
     const require = createRequire(import.meta.url);
-    const Database = require("better-sqlite3");
+    const Database = isBunRuntime()
+      ? (require("bun:sqlite") as { Database: new (filePath: string) => any }).Database
+      : loadBetterSqlite3({ requireImpl: require });
     const db = new Database(this.filePath);
     try {
-      db.pragma("busy_timeout = 5000");
-      db.pragma("journal_mode = WAL");
+      db.exec("PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL;");
       db.exec(`
         CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS entries (
@@ -318,7 +320,7 @@ class LocalJournalIndex {
     }));
   }
 
-  close(): void { if (this.db) { this.db.pragma("wal_checkpoint(TRUNCATE)"); this.db.close(); this.db = null; } }
+  close(): void { if (this.db) { this.db.exec("PRAGMA wal_checkpoint(TRUNCATE)"); this.db.close(); this.db = null; } }
 }
 
 export class SharedMemoryJournal {
