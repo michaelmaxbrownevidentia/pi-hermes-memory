@@ -6,8 +6,8 @@ Use the root [README](README.md) for project overview, architecture, development
 
 - Memory is a frozen session-start snapshot; writes are atomic (temporary file plus rename).
 - Use `pi.exec()` for background review and retain the `§` delimiter.
-- SQLite databases remain host-local; synchronized state uses immutable journal operations, never active database files.
-- Select SQLite lazily by runtime: compiled Pi/Bun uses `bun:sqlite`; Node uses `loadBetterSqlite3()` from `src/store/sqlite-native.ts`. Never load `better-sqlite3` directly from feature code or at module scope.
+- SQLite databases remain host-local; synchronized state uses an immutable host-partitioned journal, never active database files.
+- Select SQLite lazily by runtime: compiled Pi/Bun uses `bun:sqlite`; Node uses `loadBetterSqlite3()` from `src/store/sqlite-native.ts`. Never load native modules at module scope; feature code must not load `better-sqlite3` directly.
 
 ## Validation
 
