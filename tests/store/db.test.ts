@@ -842,7 +842,7 @@ describe('DatabaseManager', () => {
       assert.doesNotThrow(() => dbManager.getDb());
     });
 
-    it('repairs recoverable corruption on open and preserves readable rows', async () => {
+    it('repairs recoverable corruption on an integrity check and preserves readable rows', async () => {
       const db = dbManager.getDb();
       db.prepare(`
         INSERT INTO sessions (id, project, cwd, started_at)
@@ -867,7 +867,9 @@ describe('DatabaseManager', () => {
 
       dbManager = new DatabaseManager(tmpDir);
       assert.doesNotThrow(() => dbManager.getDb());
-      await dbManager.waitForStartupIntegrityScan();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.strictEqual(dbManager.getLastRecovery(), null, 'open must not scan the whole file');
+      dbManager.checkIntegrity();
       const repairedDb = dbManager.getDb();
 
       assert.strictEqual(dbManager.getLastRecovery()?.strategy, 'rebuilt');
@@ -885,7 +887,7 @@ describe('DatabaseManager', () => {
       assert.ok(fs.readdirSync(tmpDir).some((name) => name.startsWith('sessions.db.corrupt-')), 'corrupt DB should be quarantined');
     });
 
-    it('reopened manager runs a fresh integrity scan after close()', async () => {
+    it('integrity check after reopen repairs corruption introduced while closed', async () => {
       const db = dbManager.getDb();
       db.prepare(`
         INSERT INTO sessions (id, project, cwd, started_at)
@@ -896,7 +898,7 @@ describe('DatabaseManager', () => {
       corruptRecoverableIndexPage(path.join(tmpDir, 'sessions.db'), 'idx_messages_timestamp');
 
       const reopenedDb = dbManager.getDb();
-      await dbManager.waitForStartupIntegrityScan();
+      dbManager.checkIntegrity();
       const recoveredDb = dbManager.getDb();
 
       assert.strictEqual(dbManager.getLastRecovery()?.strategy, 'rebuilt');

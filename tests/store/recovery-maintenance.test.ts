@@ -79,6 +79,20 @@ describe("recovery maintenance sweep", () => {
     await fs.rm(tmpDir, { recursive: true, force: true });
   });
 
+  it("skips the mutation lock for stores without snapshot files", async () => {
+    for (const name of ["project-a", "project-b", "project-c"]) {
+      await writeRaw(path.join(projectsRoot, name, "MEMORY.md"), "entry");
+    }
+
+    const result = await runRecoveryMaintenance({ config: makeConfig(), globalDir });
+    assert.equal(result.storesMaintained, 4);
+
+    // The lock coordinator database is created on first acquire, beside each store's parent.
+    for (const dir of [tmpDir, projectsRoot]) {
+      assert.ok(!(await fs.readdir(dir)).some((name) => name.startsWith(".pi-hermes-locks")), `no lock taken under ${dir}`);
+    }
+  });
+
   it("bounds dormant recovery snapshots by count without a write", async () => {
     const projectDir = path.join(projectsRoot, "project-a");
     for (let index = 0; index < 40; index++) {

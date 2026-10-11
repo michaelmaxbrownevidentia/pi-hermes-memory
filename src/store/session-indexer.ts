@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import { DEFAULT_MAX_MESSAGE_CONTENT_LENGTH } from '../constants.js';
-import { DatabaseManager } from './db.js';
+import { DatabaseManager, SQLITE_BUSY_TIMEOUT_MS } from './db.js';
 import { parseSessionFile, getSessionFiles, type ParsedSession } from './session-parser.js';
 
 export const LAST_SESSION_BACKFILL_KEY = 'last_session_backfill';
@@ -272,6 +272,72 @@ export function pruneEphemeralReviewSessions(dbManager: DatabaseManager): number
     };
 
     return db.transaction ? db.transaction(remove)() : remove();
+  });
+}
+
+/**
+ * Cap on message text deleted per batch. Trigram FTS deletes cost roughly
+ * 1-1.5 s per MB on a busy disk, so this keeps each main-thread pause short.
+ */
+export const SESSION_RETENTION_BATCH_BYTES = 256 * 1024;
+
+/**
+ * Drop the searchable text of one batch of sessions whose last message is
+ * older than the retention window. The sessions and session_files rows stay
+ * as tombstones (deleting a session would cascade to session_files and make
+ * backfill re-index the unchanged JSONL); a resumed session's file changes,
+ * so it is re-indexed in full. Pi's JSONL files are never touched.
+ *
+ * Selection and deletion share one IMMEDIATE transaction so a session resumed
+ * by another Pi cannot be pruned between them. It never waits for the write
+ * lock: under contention it throws SQLITE_BUSY and the caller retries on a
+ * later startup.
+ *
+ * @returns number of sessions pruned in this batch
+ */
+export function pruneExpiredSessionText(
+  dbManager: DatabaseManager,
+  retentionDays: number,
+  now = new Date(),
+  maxBytes = SESSION_RETENTION_BATCH_BYTES,
+): number {
+  if (!(retentionDays > 0)) return 0;
+  const cutoff = new Date(now.getTime() - retentionDays * 24 * 60 * 60 * 1000).toISOString();
+  return dbManager.withCorruptionRecovery(() => {
+    const db = dbManager.getDb();
+    const prune = (): number => {
+      const candidates = db.prepare(`
+        SELECT s.id, (SELECT SUM(LENGTH(m.content)) FROM messages m WHERE m.session_id = s.id) AS bytes
+        FROM sessions s
+        WHERE s.message_count > 0
+          AND (SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = s.id) < ?
+        LIMIT 100
+      `).all(cutoff) as Array<{ id: string; bytes: number | null }>;
+
+      const ids: string[] = [];
+      let bytes = 0;
+      for (const candidate of candidates) {
+        const size = candidate.bytes ?? 0;
+        if (ids.length > 0 && bytes + size > maxBytes) break;
+        ids.push(candidate.id);
+        bytes += size;
+      }
+      if (ids.length === 0) return 0;
+
+      const placeholders = ids.map(() => '?').join(', ');
+      db.prepare(`DELETE FROM messages WHERE session_id IN (${placeholders})`).run(...ids);
+      db.prepare(`UPDATE sessions SET message_count = 0 WHERE id IN (${placeholders})`).run(...ids);
+      return ids.length;
+    };
+
+    db.exec('PRAGMA busy_timeout = 0');
+    try {
+      if (!db.transaction) return prune();
+      const tx = db.transaction(prune);
+      return tx.immediate ? tx.immediate() : tx();
+    } finally {
+      db.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
+    }
   });
 }
 

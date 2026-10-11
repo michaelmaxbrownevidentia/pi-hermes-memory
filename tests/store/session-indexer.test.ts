@@ -19,6 +19,7 @@ import {
   truncateMessageContent,
   upsertSessionFileMetadata,
   pruneEphemeralReviewSessions,
+  pruneExpiredSessionText,
 } from '../../src/store/session-indexer.js';
 import { DEFAULT_MAX_MESSAGE_CONTENT_LENGTH } from '../../src/constants.js';
 import { parseSessionFile, type ParsedSession } from '../../src/store/session-parser.js';
@@ -252,6 +253,25 @@ describe('session-indexer', () => {
       assert.strictEqual(result.errors.length, 0);
     });
 
+    it('retention tombstones survive backfill until the session is resumed', () => {
+      const sessionsDir = path.join(tmpDir, 'sessions');
+      const filePath = path.join(sessionsDir, 'project-a', 's1.jsonl');
+      writeJsonlSession(filePath, 's1', ['s1-m1']);
+      indexAllSessions(dbManager, sessionsDir);
+      const count = () => (dbManager.getDb().prepare("SELECT COUNT(*) AS n FROM messages WHERE session_id = 's1'").get() as { n: number }).n;
+
+      assert.strictEqual(pruneExpiredSessionText(dbManager, 30, new Date('2026-07-01T00:00:00Z')), 1);
+      assert.strictEqual(count(), 0);
+      touchBackfillTimestamp(dbManager);
+      assert.strictEqual(needsBackfill(dbManager, sessionsDir), false, 'tombstone still counts as indexed');
+      assert.strictEqual(indexChangedSessions(dbManager, sessionsDir).sessionsSkipped, 1, 'unchanged file stays pruned');
+      assert.strictEqual(count(), 0);
+
+      writeJsonlSession(filePath, 's1', ['s1-m1', 's1-m2']);
+      assert.strictEqual(indexChangedSessions(dbManager, sessionsDir).sessionsIndexed, 1);
+      assert.strictEqual(count(), 2, 'resumed session is re-indexed in full');
+    });
+
     it('indexes changed files and appends newly persisted messages', () => {
       const sessionsDir = path.join(tmpDir, 'sessions');
       const filePath = path.join(sessionsDir, 'project-a', 's1.jsonl');
@@ -450,6 +470,44 @@ describe('session-indexer', () => {
       assert.strictEqual(dbManager.getStats().messages, 0);
     });
 
+    it('pruneExpiredSessionText drops old session text but keeps tombstones', () => {
+      const now = new Date('2026-07-01T00:00:00Z');
+      indexSession(dbManager, createTestSession({ id: 'old', messages: [
+        { id: 'old-1', role: 'user', content: 'ancient zebra notes', timestamp: '2026-05-01T00:00:00Z' },
+      ] }));
+      indexSession(dbManager, createTestSession({ id: 'resumed', messages: [
+        { id: 'resumed-1', role: 'user', content: 'old start', timestamp: '2026-05-01T00:00:00Z' },
+        { id: 'resumed-2', role: 'user', content: 'recent follow-up', timestamp: '2026-06-25T00:00:00Z' },
+      ] }));
+      const db = dbManager.getDb();
+      db.prepare('INSERT INTO session_files (path, session_id, size, mtime_ms, indexed_at) VALUES (?, ?, ?, ?, ?)')
+        .run('/sessions/old.jsonl', 'old', 10, 1, now.toISOString());
+
+      assert.strictEqual(pruneExpiredSessionText(dbManager, 0, now), 0, '0 keeps everything');
+      assert.strictEqual(pruneExpiredSessionText(dbManager, 30, now), 1);
+      assert.strictEqual(pruneExpiredSessionText(dbManager, 30, now), 0, 'tombstones are not re-selected');
+
+      const count = (sql: string, ...args: unknown[]) => (db.prepare(sql).get(...args) as { n: number }).n;
+      assert.strictEqual(count('SELECT COUNT(*) AS n FROM messages WHERE session_id = ?', 'old'), 0);
+      assert.strictEqual(count('SELECT COUNT(*) AS n FROM messages WHERE session_id = ?', 'resumed'), 2, 'last activity decides');
+      assert.strictEqual(count('SELECT message_count AS n FROM sessions WHERE id = ?', 'old'), 0);
+      assert.strictEqual(count('SELECT COUNT(*) AS n FROM session_files WHERE session_id = ?', 'old'), 1, 'backfill must keep skipping the unchanged file');
+      assert.strictEqual(count("SELECT COUNT(*) AS n FROM message_fts WHERE message_fts MATCH 'zebra'"), 0, 'FTS entry removed');
+    });
+
+    it('pruneExpiredSessionText works in size-bounded batches', () => {
+      for (let i = 0; i < 5; i++) {
+        indexSession(dbManager, createTestSession({ id: `s${i}` }));
+      }
+      const now = new Date('2026-07-01T00:00:00Z');
+      // 'Hello' + 'Hi there!' = 14 characters per session; a budget of 28 takes two.
+      assert.strictEqual(pruneExpiredSessionText(dbManager, 30, now, 28), 2);
+      assert.strictEqual(pruneExpiredSessionText(dbManager, 30, now, 28), 2);
+      assert.strictEqual(pruneExpiredSessionText(dbManager, 30, now, 1), 1, 'always makes progress');
+      assert.strictEqual(dbManager.getStats().messages, 0);
+      assert.strictEqual(dbManager.getStats().sessions, 5);
+    });
+
     it('indexCurrentSession indexes missing live messages idempotently', () => {
       const entries = [
         {
@@ -525,7 +583,8 @@ describe('session-indexer', () => {
       indexAllSessions(dbManager, sessionsDir);
       touchBackfillTimestamp(dbManager, new Date('2026-05-03T00:30:00Z'));
 
-      assert.strictEqual(needsBackfill(dbManager, sessionsDir, new Date('2026-05-03T01:00:00Z')), false);
+      touchBackfillTimestamp(dbManager);
+      assert.strictEqual(needsBackfill(dbManager, sessionsDir), false, 'tombstone still counts as indexed');
     });
 
     it('needsBackfill is true when file metadata changes even with a recent timestamp', () => {

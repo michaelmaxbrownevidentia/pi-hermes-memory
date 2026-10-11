@@ -79,6 +79,8 @@ export interface MemoryConfig {
   failureInjectionEnabled: boolean;
   /** Maximum age in days for injected failure memories. Default: 7 */
   failureInjectionMaxAgeDays: number;
+  /** Days of searchable session text kept in sessions.db, by last message. 0 = keep forever. Default: 30 */
+  sessionRetentionDays?: number;
   /** Maximum number of failure memories to inject. Default: 5 */
   failureInjectionMaxEntries: number;
   /** Tool calls before triggering background review (in addition to turn count). Default: 15 */
