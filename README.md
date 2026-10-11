@@ -575,6 +575,7 @@ Create `~/.pi/agent/hermes-memory-config.json`:
 | `correctionDirectiveWords` | unset | Optional directive words replacing the weak-pattern directive words; omitted preserves defaults |
 | `failureInjectionEnabled` | `true` | Legacy mode only: enable/disable injecting recent failure memories into the system prompt |
 | `failureInjectionMaxAgeDays` | `7` | Legacy mode only: maximum age in days for injected failure memories |
+| `sessionRetentionDays` | `30` | Days of session text kept searchable in `sessions.db`, by each session's last message. Older text is dropped at startup; Pi's own session files are untouched and a resumed session is re-indexed. `0` keeps everything |
 | `failureInjectionMaxEntries` | `5` | Legacy mode only: maximum number of failure memories to inject |
 | `flushOnCompact` | `true` | Flush memories before Pi compacts context |
 | `flushOnShutdown` | `true` | Flush memories when session ends |

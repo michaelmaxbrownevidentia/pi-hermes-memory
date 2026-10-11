@@ -163,7 +163,6 @@ export class DatabaseManager {
   private readonly recoveryOptions: ResolvedDatabaseRecoveryOptions;
   private lastRecovery: DatabaseRecoveryResult | null = null;
   private openGuard: (() => void) | null = null;
-  private pendingOpenIntegrityScan: Promise<void> | null = null;
   private activeRecoveryLease: { coordinator: AtomicLockCoordinator; key: string; token: string } | null = null;
 
   constructor(memoryDir: string, recoveryOptions: DatabaseRecoveryOptions = {}) {
@@ -293,52 +292,26 @@ export class DatabaseManager {
         return recoveredDb;
       }
 
-      this.scheduleOpenIntegrityScan(opened);
       return opened;
     });
   }
 
   /**
-   * quick_check walks the whole DB, so open() never pays that cost: the scan
-   * runs after open returns and failures go through the same recovery used
-   * at operation time.
+   * Run PRAGMA quick_check on demand and rebuild on failure. It is not run on
+   * open: it walks the whole file synchronously on Pi's main thread (seconds
+   * for a few hundred MB, minutes under disk contention) and froze startup.
+   * Corruption hit during normal operations still goes through
+   * withCorruptionRecovery.
    */
-  private scheduleOpenIntegrityScan(db: DatabaseLike): void {
-    if (this.pendingOpenIntegrityScan) return;
-    const scan = new Promise<void>((resolve) => {
-      setTimeout(() => {
-        try {
-          if (this.db !== db) {
-            // Manager closed or reopened; the newest open schedules its own
-            // scan, so skip to avoid a stale-handle recovery.
-            return;
-          }
-          measureLifecycleSync('database.quick-check', () => {
-            try {
-              this.assertIntegrityOk(db, 'quick_check', 'after open');
-            } catch (err) {
-              try {
-                this.recoverFromCorruption(err);
-              } catch {
-                // Best-effort here; at-operation withCorruptionRecovery still
-                // quarantines and rebuilds if a later statement hits the corruption.
-              }
-            }
-          });
-        } finally {
-          if (this.pendingOpenIntegrityScan === scan) {
-            this.pendingOpenIntegrityScan = null;
-          }
-          resolve();
-        }
-      }, 0);
+  checkIntegrity(): void {
+    const db = this.getDb();
+    measureLifecycleSync('database.quick-check', () => {
+      try {
+        this.assertIntegrityOk(db, 'quick_check', 'on request');
+      } catch (err) {
+        this.recoverFromCorruption(err);
+      }
     });
-    this.pendingOpenIntegrityScan = scan;
-  }
-
-  /** Test aid. */
-  async waitForStartupIntegrityScan(): Promise<void> {
-    await this.pendingOpenIntegrityScan;
   }
 
   private openUnchecked(): DatabaseLike {
@@ -1146,7 +1119,6 @@ export class DatabaseManager {
       try { db.close(); } catch { /* best effort — close may throw on a corrupt handle */ }
       this.db = null;
     }
-    this.pendingOpenIntegrityScan = null;
   }
 
   /**

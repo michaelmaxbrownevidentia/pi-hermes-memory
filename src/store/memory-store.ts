@@ -174,7 +174,19 @@ export class MemoryStore {
   async maintainRecoveryFiles(): Promise<void> {
     for (const target of ["memory", "user", "failure"] as const) {
       const filePath = await this.resolveStoragePath(target);
+      // Deciding needs no lock. Most dormant stores have no sidecars, and a
+      // lock per store made this sweep take minutes with ~1,000 project stores.
+      if (!(await this.hasRecoverySidecars(filePath))) continue;
       await withMarkdownMutationLock(filePath, () => this.pruneRecoveryFiles(filePath));
+    }
+  }
+
+  private async hasRecoverySidecars(filePath: string): Promise<boolean> {
+    const prefixes = ["recovery-", "retired-", "conflict-local-"].map((kind) => `.${path.basename(filePath)}.${kind}`);
+    try {
+      return (await fs.readdir(path.dirname(filePath))).some((name) => prefixes.some((prefix) => name.startsWith(prefix)));
+    } catch {
+      return false;
     }
   }
 
